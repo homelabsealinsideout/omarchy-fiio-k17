@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""FiiO K17 network control for the Omarchy plugin io.github.homelabsealinsideout.fiio-k17.
+
+  k17-vol daemon                   run the connection daemon (started by the plugin)
+  k17-vol status [JSON]            JSON status; JSON applies the plugin settings first
+  k17-vol get | set N | up [STEP] | down [STEP] | mute
+  k17-vol eq VALUE                 EQ preset code, see docs/PROTOCOL.md
+  k17-vol input N                  input 1-8
+  k17-vol eqbands                  JSON bands of the active EQ
+  k17-vol eqset JSON               apply bands live (custom EQs only, not saved)
+  k17-vol eqsave | eqreset         store / flatten the active custom EQ (reset is stored at once)
+  k17-vol eqname SLOT NAME         rename custom EQ SLOT (0xA0-0xA9), up to 8 bytes
+  k17-vol eqdiscard                drop unsaved band changes (reloads the stored EQ)
+  k17-vol eqbackup [FILE]          save all custom EQs to a backup file, print its path
+  k17-vol eqbackups                JSON list of backup files
+  k17-vol eqrestore FILE [SLOT..]  restore custom EQs from a backup (backs up first)
+  k17-vol discover [SECONDS]       find K17s on the local network (JSON)
+  k17-vol eqautoeq FILE            apply an AutoEQ ParametricEQ.txt to the active custom EQ (live)
+  k17-vol pick open|save TITLE PATTERN DIR [NAME]
+                                   system file dialog (desktop portal, zenity as fallback);
+                                   prints the chosen path, nothing when cancelled
+  k17-vol key up|down|mute         for volume-key bindings: K17 when enabled and
+                                   reachable, otherwise the regular Omarchy volume
+
+The K17 accepts a single network client, so one daemon owns the connection and
+everything else talks to it over a unix socket. The daemon also watches PipeWire:
+the K17 only appears as a USB sink while its input is USB, so with usbAuto it becomes
+the default output while present and the previous default is restored afterwards.
+See docs/PROTOCOL.md for the wire protocol.
+"""
+import glob, ipaddress, json, math, os, re, signal, socket, struct, subprocess, sys, threading, time
+
+# Private per-user runtime directory, never a shared temporary one.
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache/fiio-k17")
+os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+SOCK = os.path.join(RUNTIME, "fiio-k17.sock")
+USB_STATE = os.path.join(RUNTIME, "fiio-k17.previous-sink")
+K17_SINK = re.compile(r"alsa_output\.usb-.*K17", re.I)
+STEP = 2
+BACKUP_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "fiio-k17", "backups")
+CUSTOM_SLOTS = range(0xA0, 0xAA)
+
+# Plugin settings (manifest.json keys) and their defaults.
+DEFAULTS = {"host": "", "barInput": True, "barEq": False, "barVolume": True, "volumeKeys": True, "usbAuto": False, "keyMaxVolume": 100, "releaseForApp": False}
+
+INPUTS = {1: "USB", 2: "Optical", 3: "Coaxial", 4: "Line In", 5: "Balanced In",
+          6: "Bluetooth", 7: "Streaming", 8: "Local Play"}
+INPUT_SHORT = {1: "USB", 2: "OPT", 3: "COAX", 4: "LINE", 5: "BAL", 6: "BT", 7: "NET", 8: "LOCAL"}
+EQS = {0xFF: "Off", 0x00: "Jazz", 0x01: "Rock", 0x02: "R&B", 0x03: "Hip-Hop",
+       0x04: "Pop", 0x05: "Dance", 0x06: "Classical",
+       **{0xA0 + i: f"Custom {i + 1}" for i in range(10)}}
+
+
+EQ_BANDS = 31
+EQ_TYPES = ("peak", "lowshelf", "highshelf")
+
+
+def band_from_raw(i, rec):
+    gain, code, q, kind = int(rec[0:4], 16), int(rec[4:8], 16), int(rec[8:12], 16), int(rec[12:14], 16)
+    return {"band": i, "gain": round((gain - 120) / 5, 1), "hz": round(20 * 10 ** ((code - 1) / 120)),
+            "q": round(max(0.1, (q - 8) / 10), 1), "type": EQ_TYPES[kind] if kind < len(EQ_TYPES) else kind,
+            "code": code, "raw": rec.upper()}
+
+
+def default_band_raw(i):
+    """A flat band as the device keeps unused ones: 1, 12, 24, ... 360 on its scale."""
+    return f"0078{1 if i == 0 else i * 12:04X}001000"
+
+
+def band_to_raw(b):
+    # Bands nobody changed go back exactly as read: the device stores values the
+    # formulas below cannot reproduce (e.g. a Q of raw 0 in FiiO's own presets).
+    if b.get("raw"):
+        return b["raw"]
+    gain = round(120 + max(-12.0, min(12.0, float(b["gain"]))) * 5)
+    # Keep the device's own frequency step unless the frequency was changed, so
+    # rounding to whole Hz never shifts bands nobody touched.
+    code = b.get("code")
+    if code is None or round(20 * 10 ** ((code - 1) / 120)) != round(float(b["hz"])):
+        code = round(1 + 120 * math.log10(max(20.0, min(20000.0, float(b["hz"]))) / 20))
+    q = round(max(0.2, min(10.0, float(b["q"]))) * 10 + 8)
+    kind = EQ_TYPES.index(b["type"]) if b["type"] in EQ_TYPES else int(b["type"])
+    return f"{gain:04X}{max(1, min(360, code)):04X}{q:04X}{kind:02X}"
+
+
+class Offline(Exception):
+    """The K17 cannot be used right now; volume keys fall back to PipeWire."""
+
+
+class Link:
+    """One FiiO Link connection (TCP 12100). Frames are ASCII: 4-char command,
+    4 hex digits of total length, payload. Replies swap the first digit for "a";
+    the device also sends frames of its own, so replies are matched by command."""
+
+    def __init__(self):
+        self.s = None
+        self.host = None
+        self.buf = b""
+        self.down_until = 0.0
+        self.eq_names = None
+
+    def reachable(self, host):
+        if host != self.host:
+            self.close()
+            self.host, self.down_until = host, 0.0
+        if time.monotonic() < self.down_until:
+            return False
+        # Ping first so a switched-off K17 costs 0.3s instead of TCP timeouts.
+        if subprocess.run(["ping", "-c1", "-W0.3", host], capture_output=True).returncode == 0:
+            return True
+        self.close()
+        self.down_until = time.monotonic() + 3
+        return False
+
+    def connect(self):
+        # The device re-opens its listener ~1s after a client disconnects.
+        for _ in range(8):
+            try:
+                self.s = socket.create_connection((self.host, 12100), timeout=0.5)
+                self.s.settimeout(1)
+                self.buf, self.eq_names = b"", None
+                return
+            except OSError:
+                time.sleep(0.2)
+        raise Offline(f"{self.host}:12100 not reachable (is the FiiO app connected?)")
+
+    def frame(self, deadline):
+        while len(self.buf) < 8 or len(self.buf) < int(self.buf[4:8], 16):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"no reply, partial {self.buf[:40]!r}")
+            try:
+                chunk = self.s.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise OSError("closed")
+            self.buf += chunk
+        n = int(self.buf[4:8], 16)
+        f, self.buf = self.buf[:n], self.buf[n:]
+        return f
+
+    def request(self, cmd, timeout=1):
+        # Setters for EQ, input, and EQ names answer with their getter's code.
+        want = {b"0690": b"A639", b"0657": b"A607", b"0677": b"A627"}.get(cmd[:4], b"A" + cmd[1:4].upper())
+        for attempt in (0, 1):
+            try:
+                if self.s is None:
+                    self.connect()
+                self.s.sendall(cmd)
+                deadline = time.monotonic() + timeout
+                while True:
+                    f = self.frame(deadline)
+                    if f[:4].upper() == want:
+                        return f[8:]
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                self.close()
+                if attempt:
+                    raise
+
+    def value(self, cmd, timeout=1):
+        return int(self.request(cmd, timeout)[:4], 16)
+
+    def get(self):
+        return json.loads(self.request(b"05010008"))["currentVolume"]
+
+    def set(self, v):
+        v = max(0, min(100, v))
+        if self.value(f"0502000c{v:04X}".encode()) != v:
+            raise RuntimeError(f"device did not ack volume {v}")
+        return v
+
+    def get_eq(self):
+        return self.value(b"0639000c0000")
+
+    def set_eq(self, v):
+        if v not in EQS:
+            raise ValueError(f"unknown EQ {v:#x}")
+        if self.value(f"0690000c{v:04X}".encode()) != v:
+            raise RuntimeError(f"device did not ack EQ {v:#x}")
+        return v
+
+    def custom_eq_names(self):
+        if self.eq_names is None:
+            raw = bytes.fromhex(self.request(b"062700100000A0A9")[4:].decode())
+            size = len(raw) // 10
+            self.eq_names = [raw[i * size:(i + 1) * size].split(b"\0")[0].decode(errors="replace").strip()
+                             for i in range(10)]
+        return self.eq_names
+
+    def send(self, cmd):
+        """Fire-and-forget frame (the device does not answer EQ band writes)."""
+        if self.s is None:
+            self.connect()
+        self.s.sendall(cmd)
+
+    def eq_raw(self):
+        """The active EQ's bands as the device stores them (31 × 14 hex chars).
+        The count field holds the last band index, so 001E means 31 bands."""
+        d = self.request(b"062800100000001E").decode()
+        n = int(d[4:8], 16) + 1
+        return d[8:8 + n * 14]
+
+    def eq_bands(self):
+        raw = self.eq_raw()
+        return [band_from_raw(i, raw[i * 14:(i + 1) * 14]) for i in range(len(raw) // 14)]
+
+    def write_eq_raw(self, raw):
+        payload = f"0000{len(raw) // 14 - 1:04X}{raw}"
+        self.send(f"0678{8 + len(payload):04X}{payload}".encode())
+
+    def select_eq(self, v):
+        self.set_eq(v)
+        time.sleep(0.3)  # the band read right after a switch can still be the old EQ
+
+    def set_eq_bands(self, bands):
+        # 0678: 0000, last band index, then every band (7 bytes each) from band 0.
+        # Sending fewer bands than the count claims makes the device read garbage.
+        if not 0xA0 <= self.get_eq() <= 0xA9:
+            raise ValueError("only custom EQs can be edited")
+        if len(bands) != EQ_BANDS:
+            raise ValueError(f"expected {EQ_BANDS} bands")
+        self.write_eq_raw("".join(band_to_raw(b) for b in sorted(bands, key=lambda b: b["band"])))
+
+    def eq_command(self, cmd):
+        # 0626 stores the active custom EQ, 0675 flattens and stores it (answers with a639).
+        if not 0xA0 <= self.get_eq() <= 0xA9:
+            raise ValueError("only custom EQs can be edited")
+        self.send(cmd)
+        time.sleep(0.3)
+
+    def rename_eq(self, slot, name):
+        # 0677: 0000, first and last slot, then 8 NUL-padded name bytes per slot.
+        if not 0xA0 <= slot <= 0xA9:
+            raise ValueError("only custom EQs can be renamed")
+        raw = name.strip().encode()[:8].decode(errors="ignore").encode()  # keep UTF-8 whole
+        payload = f"0000{slot:02X}{slot:02X}" + raw.ljust(8, b"\0").hex().upper()
+        reply = self.request(f"0677{8 + len(payload):04X}{payload}".encode())
+        self.eq_names = None
+        got = bytes.fromhex(reply[4:].decode()).split(b"\0")[0].decode(errors="replace")
+        if got != raw.decode():
+            raise RuntimeError(f"device kept the name {got!r}")
+        return got
+
+    def get_input(self):
+        return self.value(b"0607000c0000")
+
+    def set_input(self, n):
+        if n not in INPUTS:
+            raise ValueError(f"unknown input {n}")
+        if self.get_input() == n:
+            return n  # the device does not answer a switch to the active input
+        cmd = f"0657000c{n:04X}".encode()
+        for _ in range(3):  # switching takes seconds and sometimes needs a resend
+            try:
+                if self.value(cmd, timeout=4) == n:
+                    return n
+            except TimeoutError:
+                pass
+            if self.get_input() == n:
+                return n
+        raise RuntimeError(f"input {n} did not become active")
+
+    def close(self):
+        if self.s:
+            self.s.close()
+        self.s = None
+
+
+def pactl(*args):
+    return subprocess.run(["pactl", *args], capture_output=True, text=True).stdout
+
+
+def autoeq_bands(filters):
+    """Bands for an AutoEQ import: the filters on bands 0.., the rest flat."""
+    bands = []
+    for i in range(EQ_BANDS):
+        if i < len(filters):
+            f = filters[i]
+            bands.append({"band": i, "gain": f["gain"], "hz": f["hz"], "q": f["q"], "type": f["type"]})
+        else:
+            bands.append(band_from_raw(i, default_band_raw(i)))
+    return bands
+
+
+def pick_file(mode, title, pattern, folder, name=""):
+    """System file dialog through xdg-desktop-portal, the same one browsers use;
+    zenity when the portal is not available. Returns "" when cancelled."""
+    os.makedirs(folder, exist_ok=True)
+    try:
+        return _portal_pick(mode, title, pattern, folder, name)
+    except Exception as e:
+        log(f"portal file chooser unavailable ({e}), trying zenity")
+    cmd = ["zenity", "--file-selection", f"--title={title}", f"--file-filter={pattern}",
+           f"--filename={os.path.join(folder, name) if name else folder + '/'}"]
+    if mode == "save":
+        cmd += ["--save", "--confirm-overwrite"]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        raise RuntimeError("no file dialog available (install xdg-desktop-portal-gtk or zenity)")
+
+
+def _portal_pick(mode, title, pattern, folder, name):
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    from urllib.parse import unquote, urlparse
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    token = f"k17_{os.getpid()}"
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    loop, result = GLib.MainLoop(), {}
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params):
+        code, results = params.unpack()
+        uris = results.get("uris", []) if code == 0 else []
+        result["path"] = unquote(urlparse(uris[0]).path) if uris else ""
+        loop.quit()
+
+    def subscribe(path):
+        return bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                                    "Response", path, None, Gio.DBusSignalFlags.NO_MATCH_RULE, on_response)
+
+    # Subscribe before calling, so a fast answer cannot be missed.
+    subs = [subscribe(handle)]
+    options = {
+        "handle_token": GLib.Variant("s", token),
+        "modal": GLib.Variant("b", True),
+        "filters": GLib.Variant("a(sa(us))", [(pattern, [(0, pattern)])]),
+        "current_folder": GLib.Variant("ay", folder.encode() + b"\0"),
+    }
+    if mode == "save" and name:
+        options["current_name"] = GLib.Variant("s", name)
+    reply = bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                          "org.freedesktop.portal.FileChooser", "SaveFile" if mode == "save" else "OpenFile",
+                          GLib.Variant("(ssa{sv})", ("", title, options)), None, Gio.DBusCallFlags.NONE, -1, None)
+    # Older portals ignore handle_token and answer on another request path.
+    returned = reply.unpack()[0]
+    if returned != handle:
+        subs.append(subscribe(returned))
+    # Never wait forever on a portal that died with the dialog open.
+    GLib.timeout_add_seconds(600, loop.quit)
+    loop.run()
+    for sub in subs:
+        bus.signal_unsubscribe(sub)
+    return result.get("path", "")
+
+
+def backup_eqs(link, host, path=None):
+    """Read every custom EQ (switching through them) into a timestamped file."""
+    orig = link.get_eq()
+    names = link.custom_eq_names()
+    slots = []
+    try:
+        for slot in CUSTOM_SLOTS:
+            link.select_eq(slot)
+            raw = link.eq_raw()
+            slots.append({"slot": f"{slot:02X}", "name": names[slot - 0xA0], "raw": raw,
+                          "bands": [b for b in (band_from_raw(i, raw[i * 14:(i + 1) * 14]) for i in range(len(raw) // 14))
+                                    if b["gain"] or b["type"] != "peak"]})
+    finally:
+        link.set_eq(orig)
+    if not path:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        path = os.path.join(BACKUP_DIR, time.strftime("k17-eq-%Y%m%d-%H%M%S.json"))
+    with open(path, "w") as f:
+        json.dump({"format": "fiio-k17-eq", "version": 2, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                   "host": host, "slots": slots}, f, indent=1)
+        f.write("\n")
+    return path
+
+
+def list_backups():
+    out = []
+    for path in sorted(glob.glob(os.path.join(BACKUP_DIR, "*.json")), reverse=True):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            out.append({"path": path, "created": data.get("created", ""),
+                        "names": [s["name"] for s in data["slots"] if s.get("name")]})
+        except (OSError, ValueError, KeyError):
+            continue
+    return out
+
+
+def restore_eqs(link, host, path, only=None):
+    """Write custom EQs from a backup file back to the device and store them.
+    Always writes a fresh backup first, so a restore can itself be undone."""
+    with open(path) as f:
+        data = json.load(f)
+    if data.get("format") != "fiio-k17-eq":
+        raise ValueError(f"{path} is not a K17 EQ backup")
+    safety = backup_eqs(link, host)
+    orig = link.get_eq()
+    done = []
+    try:
+        for s in data["slots"]:
+            slot = int(s["slot"], 16)
+            if slot not in CUSTOM_SLOTS or (only and slot not in only):
+                continue
+            raw = s["raw"].upper()
+            if len(raw) == 30 * 14:  # version 1 backups missed the last band
+                raw += default_band_raw(30)
+            if len(raw) != EQ_BANDS * 14 or not re.fullmatch(r"[0-9A-F]+", raw):
+                raise ValueError(f"slot {s['slot']}: bad band data")
+            link.select_eq(slot)
+            link.write_eq_raw(raw)
+            time.sleep(0.3)
+            if link.eq_raw().upper() != raw:
+                raise RuntimeError(f"slot {s['slot']}: device did not take the bands")
+            link.send(b"0626000c0000")  # store
+            time.sleep(0.3)
+            link.rename_eq(slot, s.get("name", ""))
+            done.append(s["slot"])
+    finally:
+        link.set_eq(orig)
+    return {"restored": done, "backup": safety}
+
+
+def parse_autoeq(text):
+    """AutoEQ / Equalizer APO ParametricEQ.txt: Preamp plus PK/LSC/HSC filters."""
+    kinds = {"PK": "peak", "PEQ": "peak", "LS": "lowshelf", "LSC": "lowshelf", "LSQ": "lowshelf",
+             "HS": "highshelf", "HSC": "highshelf", "HSQ": "highshelf"}
+    preamp, filters = 0.0, []
+    for line in text.splitlines():
+        m = re.match(r"\s*Preamp:\s*(-?[\d.]+)\s*dB", line, re.I)
+        if m:
+            preamp = float(m.group(1))
+            continue
+        m = re.match(r"\s*Filter\s*\d*:\s*ON\s+(\w+)\s+Fc\s+([\d.]+)\s*Hz\s+Gain\s+(-?[\d.]+)\s*dB(?:\s+Q\s+([\d.]+))?", line, re.I)
+        if m and m.group(1).upper() in kinds:
+            filters.append({"type": kinds[m.group(1).upper()], "hz": float(m.group(2)),
+                            "gain": float(m.group(3)), "q": float(m.group(4) or 0.71)})
+    if not filters:
+        raise ValueError("no filters found (expected an AutoEQ ParametricEQ.txt)")
+    if len(filters) > EQ_BANDS:
+        raise ValueError(f"{len(filters)} filters, the K17 has {EQ_BANDS} bands")
+    return preamp, filters
+
+
+def discover(seconds=3.0):
+    """Find K17s: they announce "K17" to 224.0.0.255:12101 every 2 s while no
+    client is connected (same network segment only). Connected ones are found by
+    probing TCP 12100 on the local /24 networks."""
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("", 12101))
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                     struct.pack("4s4s", socket.inet_aton("224.0.0.255"), socket.inet_aton("0.0.0.0")))
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            s.settimeout(left)
+            try:
+                data, (ip, _) = s.recvfrom(64)
+                found[ip] = data.decode(errors="replace").strip() or "K17"
+            except socket.timeout:
+                break
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+    nets = set()
+    for line in subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout.splitlines():
+        m = re.search(r"inet (\S+)", line)
+        if m:
+            net = ipaddress.ip_interface(m.group(1)).network
+            if net.is_private and not net.is_loopback and 22 <= net.prefixlen <= 30:
+                nets.add(ipaddress.ip_network(f"{net.network_address}/24", strict=False) if net.prefixlen < 24 else net)
+
+    def probe(ip):
+        try:
+            socket.create_connection((ip, 12100), timeout=0.4).close()
+            found.setdefault(ip, "K17")
+        except OSError:
+            pass
+
+    threads = [threading.Thread(target=probe, args=(str(h),)) for n in nets for h in n.hosts()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [{"host": ip, "name": name} for ip, name in sorted(found.items())]
+
+
+class UsbWatcher(threading.Thread):
+    """Make the K17's USB sink the default output while it exists, then restore
+    whatever was the default before."""
+
+    def __init__(self, settings):
+        super().__init__(daemon=True)
+        self.settings = settings
+        self.present = None
+
+    def previous(self, value=None):
+        if value is None:
+            try:
+                with open(USB_STATE) as f:
+                    return f.read().strip() or None
+            except OSError:
+                return None
+        with open(USB_STATE, "w") as f:
+            f.write(value)
+
+    def check(self):
+        names = [l.split("\t")[1] for l in pactl("list", "short", "sinks").splitlines() if "\t" in l]
+        k17 = next((s for s in names if K17_SINK.search(s)), None)
+        if k17 and self.present != k17:
+            default = pactl("get-default-sink").strip()
+            if self.settings["usbAuto"] and default != k17:
+                self.previous(default)
+                pactl("set-default-sink", k17)
+                log(f"usb: {k17} appeared, now default (was {default})")
+        elif not k17 and self.present is not False:
+            prev = self.previous()
+            if prev and prev in names:
+                pactl("set-default-sink", prev)
+                log(f"usb: K17 gone, restored {prev}")
+            if prev:
+                os.unlink(USB_STATE)
+        self.present = k17 or False
+
+    def run(self):
+        while True:
+            self.check()
+            p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+            for line in p.stdout:
+                if "on sink #" in line and ("'new'" in line or "'remove'" in line):
+                    time.sleep(0.5)  # let WirePlumber settle before overriding it
+                    self.check()
+            time.sleep(2)  # PipeWire restarted; resubscribe
+
+
+class Daemon:
+    def __init__(self):
+        self.settings = dict(DEFAULTS)
+        self.link = Link()
+        self.cache = {}
+
+    def configure(self, new):
+        for k, v in new.items():
+            if k in DEFAULTS:
+                self.settings[k] = type(DEFAULTS[k])(v)
+
+    def online(self):
+        host = self.settings["host"].strip()
+        if not host:
+            raise Offline("no IP address set")
+        if self.settings["releaseForApp"]:
+            self.link.close()
+            raise Offline("connection released for the FiiO app")
+        if not self.link.reachable(host):
+            self.cache.pop("v", None)
+            raise Offline(f"{host} unreachable")
+
+    def volume(self):
+        # Trust the cached value while keys are being pressed; re-read once idle
+        # so changes made on the knob are picked up.
+        if self.cache.get("v") is None or time.monotonic() - self.cache.get("t", 0) > 1.5:
+            self.cache["v"] = self.link.get()
+        return self.cache["v"]
+
+    def remember(self, v):
+        self.cache.update(v=v, t=time.monotonic())
+        return v
+
+    def step(self, up, amount=STEP):
+        cur = self.volume()
+        # The key limit only stops going louder; a higher level set on the knob
+        # is left alone (up keeps it, down steps down from it).
+        cap = max(self.settings["keyMaxVolume"], cur)
+        return self.remember(self.link.set(min(cap, cur + amount) if up else cur - amount))
+
+    def mute(self):
+        cur = self.volume()
+        if cur:
+            self.cache["unmute"] = cur
+            return self.remember(self.link.set(0))
+        return self.remember(self.link.set(self.cache.get("unmute", 0)))
+
+    def status(self):
+        st = {"host": self.settings["host"], "online": False,
+              "inputs": [{"value": k, "label": v, "short": INPUT_SHORT[k]} for k, v in INPUTS.items()]}
+        try:
+            self.online()
+            names = self.link.custom_eq_names()
+            st.update(online=True, volume=self.remember(self.link.get()),
+                      eq=self.link.get_eq(), input=self.link.get_input())
+            st["eqs"] = [{"value": k, "label": v + (f" · {names[k - 0xA0]}" if 0xA0 <= k <= 0xA9 and names[k - 0xA0] else "")}
+                         for k, v in EQS.items()]
+        except Exception as e:
+            st["error"] = str(e)
+        return st
+
+    def handle(self, args):
+        cmd, rest = (args[0], args[1:]) if args else ("status", [])
+        if cmd == "status":
+            if rest:
+                self.configure(json.loads(" ".join(rest)))
+            return json.dumps(self.status())
+        if cmd == "key":
+            # A press that waited out a long backup or restore is stale; its
+            # client gave up long ago, so do not replay it now.
+            if len(rest) > 1 and time.time() - float(rest[1]) > 2.5:
+                return "stale"
+            # Volume keys: "pipewire" tells the client to use the regular volume.
+            if not self.settings["volumeKeys"]:
+                return "pipewire"
+            try:
+                self.online()
+            except Offline:
+                return "pipewire"
+            cmd, rest = rest[0], []
+        else:
+            self.online()
+        if cmd == "get":
+            return self.volume()
+        if cmd == "set":
+            return self.remember(self.link.set(int(rest[0])))
+        if cmd in ("up", "down"):
+            return self.step(cmd == "up", int(rest[0]) if rest else STEP)
+        if cmd == "mute":
+            return self.mute()
+        if cmd == "eq":
+            return self.link.set_eq(int(rest[0], 0))
+        if cmd == "input":
+            return self.link.set_input(int(rest[0]))
+        if cmd == "eqbands":
+            return json.dumps(self.link.eq_bands())
+        if cmd == "eqset":
+            self.link.set_eq_bands(json.loads(" ".join(rest)))
+            return "ok"
+        if cmd == "eqsave":
+            self.link.eq_command(b"0626000c0000")
+            return "saved"
+        if cmd == "eqreset":
+            self.link.eq_command(b"0675000c0000")
+            return "reset"
+        if cmd == "eqdiscard":
+            cur = self.link.get_eq()
+            if not 0xA0 <= cur <= 0xA9:
+                raise ValueError("only custom EQs can be edited")
+            self.link.set_eq(0xFF)  # unsaved band changes are dropped on an EQ switch
+            self.link.set_eq(cur)
+            return "discarded"
+        if cmd == "eqautoeq":
+            with open(rest[0], errors="replace") as f:
+                preamp, filters = parse_autoeq(f.read())
+            self.link.set_eq_bands(autoeq_bands(filters))
+            return json.dumps({"filters": len(filters), "preamp": preamp})
+        if cmd == "eqbackup":
+            return backup_eqs(self.link, self.settings["host"], rest[0] if rest else None)
+        if cmd == "eqrestore":
+            only = {int(x, 16) for x in rest[1:]} or None
+            return json.dumps(restore_eqs(self.link, self.settings["host"], rest[0], only))
+        if cmd == "eqname":
+            return self.link.rename_eq(int(rest[0], 0), " ".join(rest[1:]))
+        if cmd == "raw":  # development: send one frame, print the reply payload
+            frame = rest[0].encode()
+            return self.link.request(frame, timeout=float(rest[1]) if len(rest) > 1 else 1).decode()
+        raise ValueError(__doc__.split("\n\n")[1])
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def ask(args, timeout=60):
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(timeout)
+    c.connect(SOCK)
+    with c:
+        c.sendall("\0".join(args).encode())
+        c.shutdown(socket.SHUT_WR)
+        out = b""
+        while chunk := c.recv(65536):
+            out += chunk
+    return out.decode().strip()
+
+
+def daemon():
+    # Only one daemon may hold the K17's single connection: replace a leftover one.
+    try:
+        ask(["quit"], timeout=1)
+        time.sleep(1.2)
+    except OSError:
+        pass
+    # Exit with the shell that started us so a crashed shell leaves no orphan behind.
+    parent = os.getppid()
+
+    def watch_parent():
+        while os.getppid() == parent:
+            time.sleep(1)
+        os._exit(0)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    d = Daemon()
+    UsbWatcher(d.settings).start()
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(SOCK)
+    srv.listen()
+    while True:
+        c, _ = srv.accept()
+        with c:
+            try:
+                c.settimeout(2)
+                data = b""
+                while chunk := c.recv(65536):
+                    data += chunk
+                args = data.decode().split("\0") if data else []
+                if args == ["quit"]:
+                    c.sendall(b"bye\n")
+                    d.link.close()
+                    os._exit(0)
+                out = d.handle(args)
+            except Exception as e:
+                if not isinstance(e, Offline):
+                    log(f"error: {e}")
+                out = f"error: {e}"
+            try:
+                c.sendall(f"{out}\n".encode())
+            except OSError:
+                pass
+
+
+def key(direction):
+    try:
+        out = ask(["key", direction, str(time.time())], timeout=2)
+    except (FileNotFoundError, ConnectionRefusedError):
+        out = "pipewire"  # plugin not running
+    except OSError:
+        # Busy with a backup, restore, or input switch: skip this press rather
+        # than changing the system volume instead.
+        sys.exit("k17-vol: busy")
+    if out == "pipewire":
+        action = {"up": "raise", "down": "lower", "mute": "mute-toggle"}[direction]
+        os.execvp("omarchy-audio-output-volume", ["omarchy-audio-output-volume", action])
+    if not out.isdigit():
+        sys.exit(f"k17-vol: {out}")  # never touch the system volume on other errors
+    # Same OSD as the stock volume keys; the K17 scale is 0-100 like a percentage.
+    subprocess.Popen(["omarchy-osd", "-i", "volume-high" if int(out) else "volume-muted", "-p", out])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["daemon"]:
+        return daemon()
+    if args[:1] == ["key"] and args[1:2] in (["up"], ["down"], ["mute"]):
+        return key(args[1])
+    # These need no device connection, so they run here instead of in the daemon.
+    if args[:1] == ["discover"]:
+        return print(json.dumps(discover(float(args[1]) if len(args) > 1 else 3.0)))
+    if args[:1] == ["eqbackups"]:
+        return print(json.dumps(list_backups()))
+    if args[:1] == ["pick"] and len(args) >= 5:
+        return print(pick_file(args[1], args[2], args[3], os.path.expanduser(args[4]), args[5] if len(args) > 5 else ""))
+    try:
+        out = ask(args)
+    except OSError:
+        sys.exit("k17-vol: daemon not running (is the FiiO K17 plugin enabled in Omarchy?)")
+    if out.startswith("error"):
+        sys.exit(f"k17-vol: {out}")
+    print(out)
+
+
+if __name__ == "__main__":
+    main()

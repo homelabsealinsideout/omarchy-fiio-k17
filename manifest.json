@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.homelabsealinsideout.fiio-k17",
+  "name": "FiiO K17",
+  "version": "1.0.0",
+  "author": "homelabsealinsideout",
+  "license": "MIT",
+  "description": "Control a FiiO K17 DAC/amp over the network: volume, mute, input, EQ, a custom EQ editor with AutoEQ import and backups, optional volume-key control, and automatic switching to the K17 when it is in USB mode.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "FiiO K17",
+    "description": "Input, EQ, and volume of the FiiO K17 (your choice). Click for controls, scroll for volume, right-click to mute.",
+    "category": "Audio",
+    "aliases": [
+      "fiio",
+      "k17",
+      "dac",
+      "amp"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "host": "",
+      "barInput": true,
+      "barEq": false,
+      "barVolume": true,
+      "volumeKeys": true,
+      "keyMaxVolume": 100,
+      "usbAuto": false,
+      "releaseForApp": false
+    },
+    "schema": [
+      {
+        "key": "host",
+        "type": "string",
+        "label": "IP address",
+        "defaultValue": "",
+        "description": "Network address of the K17 (Settings > About on the device)."
+      },
+      {
+        "key": "barInput",
+        "type": "boolean",
+        "label": "Show input in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "barEq",
+        "type": "boolean",
+        "label": "Show EQ in the bar",
+        "defaultValue": false
+      },
+      {
+        "key": "barVolume",
+        "type": "boolean",
+        "label": "Show volume in the bar",
+        "defaultValue": true,
+        "description": "With none of input, EQ, and volume selected the bar shows a compact K17 label."
+      },
+      {
+        "key": "volumeKeys",
+        "type": "boolean",
+        "label": "Volume keys control the K17",
+        "defaultValue": true,
+        "description": "Needs the key bindings from the README. When the K17 is off or unreachable the keys fall back to the regular system volume."
+      },
+      {
+        "key": "keyMaxVolume",
+        "type": "integer",
+        "label": "Volume limit for keys and scrolling",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 100,
+        "description": "Keys and scrolling never raise the volume above this. Levels set on the knob are left alone."
+      },
+      {
+        "key": "usbAuto",
+        "type": "boolean",
+        "label": "Switch output to K17 USB",
+        "defaultValue": false,
+        "description": "Make the K17 the default output while its input is USB, and switch back to the previous output afterwards."
+      },
+      {
+        "key": "releaseForApp",
+        "type": "boolean",
+        "label": "Release connection for the FiiO app",
+        "defaultValue": false,
+        "description": "The K17 accepts one network client. Turn this on to let the FiiO Control app connect, and off again afterwards."
+      }
+    ]
+  }
+}
